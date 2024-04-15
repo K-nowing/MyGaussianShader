@@ -172,6 +172,60 @@ class EnvironmentLight(torch.nn.Module):
         rgb = specular_linear + diffuse_linear
 
         return rgb, extras
+    
+    # def shade(self, gb_pos, gb_normal, kd, ks, kr, view_pos, specular=True):
+    def my_shade(self, gb_pos, gb_normal, a, m, r, view_pos, indirect_alpha, indirect_light, specular=True):
+        # (H, W, N, C)
+        wo = util.safe_normalize(view_pos - gb_pos)
+
+        if specular:
+            albedo = a
+            metallic = m
+            roughness = r
+        else:
+            raise NotImplementedError
+
+        reflvec = util.safe_normalize(util.reflect(wo, gb_normal))
+        nrmvec = gb_normal
+        if self.mtx is not None: # Rotate lookup
+            mtx = torch.as_tensor(self.mtx, dtype=torch.float32, device='cuda')
+            reflvec = ru.xfm_vectors(reflvec.view(reflvec.shape[0], reflvec.shape[1] * reflvec.shape[2], reflvec.shape[3]), mtx).view(*reflvec.shape)
+            nrmvec  = ru.xfm_vectors(nrmvec.view(nrmvec.shape[0], nrmvec.shape[1] * nrmvec.shape[2], nrmvec.shape[3]), mtx).view(*nrmvec.shape)
+
+        diffuse_light = dr.texture(self.diffuse[None, ...], nrmvec.contiguous(), filter_mode='linear', boundary_mode='cube')
+        diffuse_linear = diffuse_light * albedo
+
+        if specular:
+            specular_albedo = 0.04 * (1 - metallic) + metallic * albedo
+            
+            # Lookup FG term from lookup texture
+            NdotV = torch.clamp(util.dot(wo, gb_normal), min=1e-4)
+            fg_uv = torch.cat((NdotV, roughness), dim=-1)
+            if not hasattr(self, '_FG_LUT'):
+                self._FG_LUT = torch.as_tensor(np.fromfile('scene/NVDIFFREC/irrmaps/bsdf_256_256.bin', dtype=np.float32).reshape(1, 256, 256, 2), dtype=torch.float32, device='cuda')
+            fg_lookup = dr.texture(self._FG_LUT, fg_uv, filter_mode='linear', boundary_mode='clamp')
+
+            # Roughness adjusted specular env lookup
+            miplevel = self.get_mip(roughness)
+            direct_light = dr.texture(self.specular[0][None, ...], reflvec.contiguous(), mip=list(m[None, ...] for m in self.specular[1:]), mip_level_bias=miplevel[..., 0], filter_mode='linear-mipmap-linear', boundary_mode='cube')
+            
+            # specular_light = direct_light
+            specular_light = direct_light * (1 - indirect_alpha) + indirect_light * indirect_alpha
+
+            # Compute aggregate lighting
+            # reflectance = specular_tint * fg_lookup[...,0:1] + fg_lookup[...,1:2]
+            specular_albedo = specular_albedo * fg_lookup[...,0:1] + fg_lookup[...,1:2]
+            specular_linear = specular_albedo * specular_light
+            
+        rgb = linear_to_srgb(diffuse_linear + specular_linear) # gamma correction
+        extras = {"specular": linear_to_srgb(specular_linear)}
+
+        # diffuse_linear = torch.sigmoid(diffuse_raw - np.log(3.0))
+        extras["diffuse"] = linear_to_srgb(diffuse_linear)
+
+        # rgb = specular_linear + diffuse_linear
+
+        return rgb, extras
 
 ######################################################################################
 # Load and store
@@ -211,3 +265,37 @@ def extract_env_map(light, resolution=[512, 1024]):
     assert isinstance(light, EnvironmentLight), "Can only save EnvironmentLight currently"
     color = util.cubemap_to_latlong(light.base, resolution)
     return color
+
+
+# Code from NeRO
+def linear_to_srgb(linear):
+    if isinstance(linear, torch.Tensor):
+        """Assumes `linear` is in [0, 1], see https://en.wikipedia.org/wiki/SRGB."""
+        eps = torch.finfo(torch.float32).eps
+        srgb0 = 323 / 25 * linear
+        srgb1 = (211 * torch.clamp(linear, min=eps) ** (5 / 12) - 11) / 200
+        return torch.where(linear <= 0.0031308, srgb0, srgb1)
+    elif isinstance(linear, np.ndarray):
+        eps = np.finfo(np.float32).eps
+        srgb0 = 323 / 25 * linear
+        srgb1 = (211 * np.maximum(eps, linear) ** (5 / 12) - 11) / 200
+        return np.where(linear <= 0.0031308, srgb0, srgb1)
+    else:
+        raise NotImplementedError
+
+
+def srgb_to_linear(srgb):
+    if isinstance(srgb, torch.Tensor):
+        """Assumes `srgb` is in [0, 1], see https://en.wikipedia.org/wiki/SRGB."""
+        eps = torch.finfo(torch.float32).eps
+        linear0 = 25 / 323 * srgb
+        linear1 = torch.clamp(((200 * srgb + 11) / (211)), min=eps) ** (12 / 5)
+        return torch.where(srgb <= 0.04045, linear0, linear1)
+    elif isinstance(srgb, np.ndarray):
+        """Assumes `srgb` is in [0, 1], see https://en.wikipedia.org/wiki/SRGB."""
+        eps = np.finfo(np.float32).eps
+        linear0 = 25 / 323 * srgb
+        linear1 = np.maximum(((200 * srgb + 11) / (211)), eps) ** (12 / 5)
+        return np.where(srgb <= 0.04045, linear0, linear1)
+    else:
+        raise NotImplementedError

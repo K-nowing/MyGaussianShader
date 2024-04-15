@@ -35,6 +35,7 @@ class GaussianModel:
         if (brdf_dim>=0 and sh_degree>=0) or (brdf_dim<0 and sh_degree<0):
             raise Exception('Please provide exactly one of either brdf_dim or sh_degree!')
         self.brdf = brdf_dim>=0
+        self.my_brdf = brdf_dim >= 100
 
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
@@ -65,6 +66,8 @@ class GaussianModel:
         self.diffuse_activation = torch.sigmoid
         self.specular_activation = torch.sigmoid
         self.default_roughness = 0.0
+        self.metallic_activation = torch.sigmoid
+        self.metallic_bias = 0.
         self.roughness_activation = torch.sigmoid
         self.roughness_bias = 0.
         self.default_roughness = 0.6
@@ -121,6 +124,18 @@ class GaussianModel:
             return normal, delta_normal
         else:
             return normal
+        
+    @property
+    def get_albedo(self):
+        return self._albedo
+    
+    @property
+    def get_metallic(self):
+        return self.metallic_activation(self._metallic + self.metallic_bias)
+    
+    @property
+    def get_indirect_features(self):
+        return self._indirect_features
 
     @property
     def get_diffuse(self):
@@ -149,7 +164,9 @@ class GaussianModel:
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
         self.spatial_lr_scale = 5
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        if not self.brdf:
+        if self.my_brdf:
+            pass
+        elif not self.brdf:
             fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
             features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
             features[:, :3, 0 ] = fused_color
@@ -178,7 +195,23 @@ class GaussianModel:
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        if not self.brdf:
+        if self.my_brdf:
+            normals = np.zeros_like(np.asarray(pcd.points, dtype=np.float32))
+            normals2 = np.copy(normals)
+            
+            self._normal = nn.Parameter(torch.from_numpy(normals).to(self._xyz.device).requires_grad_(True))
+            self._normal2 = nn.Parameter(torch.from_numpy(normals2).to(self._xyz.device).requires_grad_(True))
+            self._roughness = nn.Parameter(self.default_roughness*torch.ones((fused_point_cloud.shape[0], 1), device="cuda").requires_grad_(True))
+            self._metallic = nn.Parameter(torch.zeros((fused_point_cloud.shape[0], 1), device="cuda").requires_grad_(True))
+            self._albedo = nn.Parameter(torch.zeros((fused_point_cloud.shape[0], 3), device="cuda").requires_grad_(True))
+            
+            # indirect_features = torch.zeros(pcd.colors.shape).float().cuda()
+            # indirect_features[:,3:].contiguous().requires_grad_(True)
+            self.indirect_dim = 3
+            indirect_features = torch.zeros((pcd.colors.shape[0], 4, (self.indirect_dim + 1) ** 2)).float().cuda()
+            self._indirect_features = nn.Parameter(indirect_features.contiguous().requires_grad_(True))
+            
+        elif not self.brdf:
             self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
             self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         else:
@@ -208,26 +241,48 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
-        l = [
-            {'params': [self._xyz], 'lr': training_args.position_lr_init*self.spatial_lr_scale, "name": "xyz"},
-            {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
-            {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
-            {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
-            {'params': [self._scaling], 'lr': training_args.scaling_lr*self.spatial_lr_scale, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
-        ]
-        if self.brdf:
-            self._normal.requires_grad_(requires_grad=False)
-            l.extend([
-                {'params': list(self.brdf_mlp.parameters()), 'lr': training_args.brdf_mlp_lr_init, "name": "brdf_mlp"},
-                {'params': [self._roughness], 'lr': training_args.roughness_lr, "name": "roughness"},
-                {'params': [self._specular], 'lr': training_args.specular_lr, "name": "specular"},
-                {'params': [self._normal], 'lr': training_args.normal_lr, "name": "normal"},
-            ])
-            self._normal2.requires_grad_(requires_grad=False)
-            l.extend([
-                {'params': [self._normal2], 'lr': training_args.normal_lr, "name": "normal2"},
-            ])
+        if self.my_brdf:
+            l = [
+                {'params': [self._xyz], 'lr': training_args.position_lr_init*self.spatial_lr_scale, "name": "xyz"},
+                {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
+                {'params': [self._scaling], 'lr': training_args.scaling_lr*self.spatial_lr_scale, "name": "scaling"},
+                {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            ]
+            if self.brdf:
+                self._normal.requires_grad_(requires_grad=False)
+                l.extend([
+                    {'params': list(self.brdf_mlp.parameters()), 'lr': training_args.brdf_mlp_lr_init, "name": "brdf_mlp"},
+                    {'params': [self._albedo], 'lr': training_args.roughness_lr, "name": "albedo"},
+                    {'params': [self._metallic], 'lr': training_args.roughness_lr, "name": "metallic"},
+                    {'params': [self._roughness], 'lr': training_args.roughness_lr, "name": "roughness"},
+                    {'params': [self._normal], 'lr': training_args.normal_lr, "name": "normal"},
+                    {'params': [self._indirect_features], 'lr': training_args.roughness_lr, "name": "indirect_features"}
+                ])
+                self._normal2.requires_grad_(requires_grad=False)
+                l.extend([
+                    {'params': [self._normal2], 'lr': training_args.normal_lr, "name": "normal2"},
+                ])
+        else:
+            l = [
+                {'params': [self._xyz], 'lr': training_args.position_lr_init*self.spatial_lr_scale, "name": "xyz"},
+                {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
+                {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
+                {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
+                {'params': [self._scaling], 'lr': training_args.scaling_lr*self.spatial_lr_scale, "name": "scaling"},
+                {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            ]
+            if self.brdf:
+                self._normal.requires_grad_(requires_grad=False)
+                l.extend([
+                    {'params': list(self.brdf_mlp.parameters()), 'lr': training_args.brdf_mlp_lr_init, "name": "brdf_mlp"},
+                    {'params': [self._roughness], 'lr': training_args.roughness_lr, "name": "roughness"},
+                    {'params': [self._specular], 'lr': training_args.specular_lr, "name": "specular"},
+                    {'params': [self._normal], 'lr': training_args.normal_lr, "name": "normal"},
+                ])
+                self._normal2.requires_grad_(requires_grad=False)
+                l.extend([
+                    {'params': [self._normal2], 'lr': training_args.normal_lr, "name": "normal2"},
+                ])
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -279,69 +334,122 @@ class GaussianModel:
                 lr = self._update_learning_rate(iteration, param)
 
     def construct_list_of_attributes(self, viewer_fmt=False):
-        l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
-        # All channels except the 3 DC
-        if not self.brdf:
-            for i in range(self._features_dc.shape[1]*self._features_dc.shape[2]):
-                l.append('f_dc_{}'.format(i))
-            for i in range(self._features_rest.shape[1]*self._features_rest.shape[2]):
-                l.append('f_rest_{}'.format(i))
-        else:
+        if self.my_brdf:
+            l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
+
             l.extend(['nx2', 'ny2', 'nz2'])
-            for i in range(self._features_dc.shape[1]):
-                l.append('f_dc_{}'.format(i))
+            for i in range(self._albedo.shape[1]):
+                l.append('albedo_{}'.format(i))
             if viewer_fmt:
                 features_rest_len = 45
-            elif (self.brdf_mode=="envmap" and self.brdf_dim==0):
-                features_rest_len = self._features_rest.shape[1]
-            elif self.brdf_mode=="envmap":
-                features_rest_len = self._features_rest.shape[1]*self._features_rest.shape[2]
-            for i in range(features_rest_len):
-                l.append('f_rest_{}'.format(i))
-        l.append('opacity')
-        for i in range(self._scaling.shape[1]):
-            l.append('scale_{}'.format(i))
-        for i in range(self._rotation.shape[1]):
-            l.append('rot_{}'.format(i))
-        if not viewer_fmt and self.brdf:
-            l.append('roughness')
-            for i in range(self._specular.shape[1]):
-                l.append('specular{}'.format(i))
+                
+            l.append('opacity')
+            for i in range(self._scaling.shape[1]):
+                l.append('scale_{}'.format(i))
+            for i in range(self._rotation.shape[1]):
+                l.append('rot_{}'.format(i))
+            if not viewer_fmt and self.brdf:
+                l.append('roughness')
+                l.append('metallic')
+            for i in range(self._indirect_features.shape[1]*self._indirect_features.shape[2]):
+                l.append('f_id_{}'.format(i))
+        else:
+            l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
+            # All channels except the 3 DC
+            if not self.brdf:
+                for i in range(self._features_dc.shape[1]*self._features_dc.shape[2]):
+                    l.append('f_dc_{}'.format(i))
+                for i in range(self._features_rest.shape[1]*self._features_rest.shape[2]):
+                    l.append('f_rest_{}'.format(i))
+            else:
+                l.extend(['nx2', 'ny2', 'nz2'])
+                for i in range(self._features_dc.shape[1]):
+                    l.append('f_dc_{}'.format(i))
+                if viewer_fmt:
+                    features_rest_len = 45
+                elif (self.brdf_mode=="envmap" and self.brdf_dim==0):
+                    features_rest_len = self._features_rest.shape[1]
+                elif self.brdf_mode=="envmap":
+                    features_rest_len = self._features_rest.shape[1]*self._features_rest.shape[2]
+                for i in range(features_rest_len):
+                    l.append('f_rest_{}'.format(i))
+            l.append('opacity')
+            for i in range(self._scaling.shape[1]):
+                l.append('scale_{}'.format(i))
+            for i in range(self._rotation.shape[1]):
+                l.append('rot_{}'.format(i))
+            if not viewer_fmt and self.brdf:
+                l.append('roughness')
+                for i in range(self._specular.shape[1]):
+                    l.append('specular{}'.format(i))
         return l
 
     def save_ply(self, path, viewer_fmt=False):
         mkdir_p(os.path.dirname(path))
 
-        xyz = self._xyz.detach().cpu().numpy()
-        normals = np.zeros_like(xyz) if not self.brdf else self._normal.detach().cpu().numpy()
-        normals2 = self._normal2.detach().cpu().numpy() if (self.brdf) else np.zeros_like(xyz)
-        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy() if not self.brdf else self._features_dc.detach().cpu().numpy()
-        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy() if not ((self.brdf and self.brdf_mode=="envmap" and self.brdf_dim==0)) else self._features_rest.detach().cpu().numpy()
-        opacities = self._opacity.detach().cpu().numpy()
-        scale = self._scaling.detach().cpu().numpy()
-        rotation = self._rotation.detach().cpu().numpy()
-        roughness = None if not self.brdf else self._roughness.detach().cpu().numpy()
-        specular = None if not self.brdf else self._specular.detach().cpu().numpy()
-        
-        if viewer_fmt:
-            f_dc = 0.5 + (0.5*normals)
-            f_rest = np.zeros((f_rest.shape[0], 45))
-            normals = np.zeros_like(normals)
+        if self.my_brdf:
+            xyz = self._xyz.detach().cpu().numpy()
+            normals = np.zeros_like(xyz) if not self.brdf else self._normal.detach().cpu().numpy()
+            normals2 = self._normal2.detach().cpu().numpy() if (self.brdf) else np.zeros_like(xyz)
+            
+            opacities = self._opacity.detach().cpu().numpy()
+            scale = self._scaling.detach().cpu().numpy()
+            rotation = self._rotation.detach().cpu().numpy()
+            albedo = self._albedo.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy() if not self.brdf else self._albedo.detach().cpu().numpy()
+            metallic = None if not self.brdf else self._metallic.detach().cpu().numpy()
+            roughness = None if not self.brdf else self._roughness.detach().cpu().numpy()
+            f_id = self._indirect_features.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+            
+            if viewer_fmt:
+                f_dc = 0.5 + (0.5*normals)
+                f_rest = np.zeros((f_rest.shape[0], 45))
+                normals = np.zeros_like(normals)
 
-        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes(viewer_fmt)]
+            dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes(viewer_fmt)]
 
-        elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        if self.brdf and not viewer_fmt:
-            attributes = np.concatenate((xyz, normals, normals2, f_dc, f_rest, opacities, scale, rotation, roughness, specular), axis=1)
+            elements = np.empty(xyz.shape[0], dtype=dtype_full)
+            if self.brdf and not viewer_fmt:
+                attributes = np.concatenate((xyz, normals, normals2, opacities, scale, rotation, albedo, roughness, metallic, f_id), axis=1)
+            else:
+                attributes = np.concatenate((xyz, normals, opacities, scale, rotation), axis=1)
+            elements[:] = list(map(tuple, attributes))
+            el = PlyElement.describe(elements, 'vertex')
+            PlyData([el]).write(path)
+
+            pcd_o3d = o3d.geometry.PointCloud()
+            pcd_o3d.points = o3d.utility.Vector3dVector(xyz)
+            pcd_o3d.colors = o3d.utility.Vector3dVector(albedo)
         else:
-            attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
-        elements[:] = list(map(tuple, attributes))
-        el = PlyElement.describe(elements, 'vertex')
-        PlyData([el]).write(path)
+            xyz = self._xyz.detach().cpu().numpy()
+            normals = np.zeros_like(xyz) if not self.brdf else self._normal.detach().cpu().numpy()
+            normals2 = self._normal2.detach().cpu().numpy() if (self.brdf) else np.zeros_like(xyz)
+            f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy() if not self.brdf else self._features_dc.detach().cpu().numpy()
+            f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy() if not ((self.brdf and self.brdf_mode=="envmap" and self.brdf_dim==0)) else self._features_rest.detach().cpu().numpy()
+            opacities = self._opacity.detach().cpu().numpy()
+            scale = self._scaling.detach().cpu().numpy()
+            rotation = self._rotation.detach().cpu().numpy()
+            roughness = None if not self.brdf else self._roughness.detach().cpu().numpy()
+            specular = None if not self.brdf else self._specular.detach().cpu().numpy()
+            
+            if viewer_fmt:
+                f_dc = 0.5 + (0.5*normals)
+                f_rest = np.zeros((f_rest.shape[0], 45))
+                normals = np.zeros_like(normals)
 
-        pcd_o3d = o3d.geometry.PointCloud()
-        pcd_o3d.points = o3d.utility.Vector3dVector(xyz)
-        pcd_o3d.colors = o3d.utility.Vector3dVector(f_dc)
+            dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes(viewer_fmt)]
+
+            elements = np.empty(xyz.shape[0], dtype=dtype_full)
+            if self.brdf and not viewer_fmt:
+                attributes = np.concatenate((xyz, normals, normals2, f_dc, f_rest, opacities, scale, rotation, roughness, specular), axis=1)
+            else:
+                attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+            elements[:] = list(map(tuple, attributes))
+            el = PlyElement.describe(elements, 'vertex')
+            PlyData([el]).write(path)
+
+            pcd_o3d = o3d.geometry.PointCloud()
+            pcd_o3d.points = o3d.utility.Vector3dVector(xyz)
+            pcd_o3d.colors = o3d.utility.Vector3dVector(f_dc)
         return pcd_o3d
 
     def reset_opacity(self):
@@ -474,17 +582,30 @@ class GaussianModel:
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
-        self._xyz = optimizable_tensors["xyz"]
-        self._features_dc = optimizable_tensors["f_dc"]
-        self._features_rest = optimizable_tensors["f_rest"]
-        self._opacity = optimizable_tensors["opacity"]
-        self._scaling = optimizable_tensors["scaling"]
-        self._rotation = optimizable_tensors["rotation"]
-        if self.brdf:
-            self._roughness = optimizable_tensors["roughness"]
-            self._specular = optimizable_tensors["specular"]
-            self._normal = optimizable_tensors["normal"]
-            self._normal2 = optimizable_tensors["normal2"]
+        if self.my_brdf:
+            self._xyz = optimizable_tensors["xyz"]
+            self._opacity = optimizable_tensors["opacity"]
+            self._scaling = optimizable_tensors["scaling"]
+            self._rotation = optimizable_tensors["rotation"]
+            if self.brdf:
+                self._albedo = optimizable_tensors["albedo"]
+                self._metallic = optimizable_tensors["metallic"]
+                self._roughness = optimizable_tensors["roughness"]
+                self._normal = optimizable_tensors["normal"]
+                self._normal2 = optimizable_tensors["normal2"]
+                self._indirect_features = optimizable_tensors["indirect_features"]
+        else:
+            self._xyz = optimizable_tensors["xyz"]
+            self._features_dc = optimizable_tensors["f_dc"]
+            self._features_rest = optimizable_tensors["f_rest"]
+            self._opacity = optimizable_tensors["opacity"]
+            self._scaling = optimizable_tensors["scaling"]
+            self._rotation = optimizable_tensors["rotation"]
+            if self.brdf:
+                self._roughness = optimizable_tensors["roughness"]
+                self._specular = optimizable_tensors["specular"]
+                self._normal = optimizable_tensors["normal"]
+                self._normal2 = optimizable_tensors["normal2"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -547,6 +668,38 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
+    def mydensification_postfix(self, new_xyz, new_opacities, new_scaling, new_rotation, \
+                              new_albedo, new_metallic, new_roughness, new_normal, new_normal2, new_indirect_features):
+        d = {"xyz": new_xyz,
+        "opacity": new_opacities,
+        "scaling" : new_scaling,
+        "rotation" : new_rotation}
+        if self.brdf:
+            d.update({
+                "albedo": new_albedo,
+                "metallic": new_metallic,
+                "roughness": new_roughness,
+                "normal" : new_normal,
+                "normal2" : new_normal2,
+                "indirect_features": new_indirect_features
+            })
+
+        optimizable_tensors = self.cat_tensors_to_optimizer(d)
+        self._xyz = optimizable_tensors["xyz"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+        if self.brdf:
+            self._albedo = optimizable_tensors["albedo"]
+            self._metallic = optimizable_tensors["metallic"]
+            self._roughness = optimizable_tensors["roughness"]
+            self._normal = optimizable_tensors["normal"]
+            self._normal2 = optimizable_tensors["normal2"]
+            self._indirect_features = optimizable_tensors["indirect_features"]
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
@@ -562,18 +715,32 @@ class GaussianModel:
         means =torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
-        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
-        new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
-        new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1) if not self.brdf else self._features_dc[selected_pts_mask].repeat(N,1)
-        new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1) if not ((self.brdf and self.brdf_mode=="envmap" and self.brdf_dim==0)) else self._features_rest[selected_pts_mask].repeat(N,1)
-        new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
-        new_roughness = self._roughness[selected_pts_mask].repeat(N,1) if self.brdf else None
-        new_specular = self._specular[selected_pts_mask].repeat(N,1) if self.brdf else None
-        new_normal = self._normal[selected_pts_mask].repeat(N,1) if self.brdf else None
-        new_normal2 = self._normal2[selected_pts_mask].repeat(N,1) if (self.brdf) else None
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, 
-                                   new_roughness, new_specular, new_normal, new_normal2)
+        if self.my_brdf:
+            new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+            new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+            new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
+            new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+            new_albedo = self._albedo[selected_pts_mask].repeat(N,1) if self.brdf else None
+            new_metallic = self._metallic[selected_pts_mask].repeat(N,1) if self.brdf else None
+            new_roughness = self._roughness[selected_pts_mask].repeat(N,1) if self.brdf else None
+            new_normal = self._normal[selected_pts_mask].repeat(N,1) if self.brdf else None
+            new_normal2 = self._normal2[selected_pts_mask].repeat(N,1) if (self.brdf) else None
+            new_indirect_features = self._indirect_features[selected_pts_mask].repeat(N,1,1) if (self.brdf) else None
+            self.mydensification_postfix(new_xyz, new_opacity, new_scaling, new_rotation, 
+                                   new_albedo, new_metallic, new_roughness, new_normal, new_normal2, new_indirect_features)
+        else:
+            new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+            new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+            new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
+            new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1) if not self.brdf else self._features_dc[selected_pts_mask].repeat(N,1)
+            new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1) if not ((self.brdf and self.brdf_mode=="envmap" and self.brdf_dim==0)) else self._features_rest[selected_pts_mask].repeat(N,1)
+            new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+            new_roughness = self._roughness[selected_pts_mask].repeat(N,1) if self.brdf else None
+            new_specular = self._specular[selected_pts_mask].repeat(N,1) if self.brdf else None
+            new_normal = self._normal[selected_pts_mask].repeat(N,1) if self.brdf else None
+            new_normal2 = self._normal2[selected_pts_mask].repeat(N,1) if (self.brdf) else None
+            self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, 
+                                    new_roughness, new_specular, new_normal, new_normal2)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -585,19 +752,33 @@ class GaussianModel:
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         if torch.sum(selected_pts_mask) == 0:
             return
-        new_xyz = self._xyz[selected_pts_mask]
-        new_features_dc = self._features_dc[selected_pts_mask]
-        new_features_rest = self._features_rest[selected_pts_mask]
-        new_opacities = self._opacity[selected_pts_mask]
-        new_scaling = self._scaling[selected_pts_mask]
-        new_rotation = self._rotation[selected_pts_mask]
-        new_roughness = self._roughness[selected_pts_mask] if self.brdf else None
-        new_specular = self._specular[selected_pts_mask] if self.brdf else None
-        new_normal = self._normal[selected_pts_mask] if self.brdf else None
-        new_normal2 = self._normal2[selected_pts_mask] if (self.brdf) else None
+        if self.my_brdf:
+            new_xyz = self._xyz[selected_pts_mask]
+            new_opacities = self._opacity[selected_pts_mask]
+            new_scaling = self._scaling[selected_pts_mask]
+            new_rotation = self._rotation[selected_pts_mask]
+            new_albedo = self._albedo[selected_pts_mask] if self.brdf else None
+            new_metallic = self._metallic[selected_pts_mask] if self.brdf else None
+            new_roughness = self._roughness[selected_pts_mask] if self.brdf else None
+            new_normal = self._normal[selected_pts_mask] if self.brdf else None
+            new_normal2 = self._normal2[selected_pts_mask] if (self.brdf) else None
+            new_indirect_features = self._indirect_features[selected_pts_mask] if (self.brdf) else None
+            self.mydensification_postfix(new_xyz, new_opacities, new_scaling, new_rotation, 
+                                   new_albedo, new_metallic, new_roughness, new_normal, new_normal2, new_indirect_features)
+        else:
+            new_xyz = self._xyz[selected_pts_mask]
+            new_features_dc = self._features_dc[selected_pts_mask]
+            new_features_rest = self._features_rest[selected_pts_mask]
+            new_opacities = self._opacity[selected_pts_mask]
+            new_scaling = self._scaling[selected_pts_mask]
+            new_rotation = self._rotation[selected_pts_mask]
+            new_roughness = self._roughness[selected_pts_mask] if self.brdf else None
+            new_specular = self._specular[selected_pts_mask] if self.brdf else None
+            new_normal = self._normal[selected_pts_mask] if self.brdf else None
+            new_normal2 = self._normal2[selected_pts_mask] if (self.brdf) else None
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, 
-                                   new_roughness, new_specular, new_normal, new_normal2)
+            self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, 
+                                       new_roughness, new_specular, new_normal, new_normal2)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom

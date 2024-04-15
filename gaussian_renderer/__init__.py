@@ -59,13 +59,14 @@ def normalize_normal_inplace(normal, alpha):
     fg_mask = (alpha[None,...]>0.).repeat(3, 1, 1)
     normal = torch.where(fg_mask, torch.nn.functional.normalize(normal, p=2, dim=0), normal)
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, debug=False, speed=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, debug=False, speed=False, my_brdf=False):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
     """
  
+    out = dict()
     # ticks = [(0,time.time())]
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
@@ -91,7 +92,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
-        # debug=False
+        debug=False
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -123,7 +124,44 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     shs = None
     colors_precomp = None
     if colors_precomp is None:
-        if pipe.brdf:
+        if my_brdf:
+            gb_pos = pc.get_xyz # (N, 3) 
+            view_pos = viewpoint_camera.camera_center.repeat(pc.get_opacity.shape[0], 1) # (N, 3) 
+            
+            albedo = pc.get_albedo
+            metallic = pc.get_metallic
+            roughness = pc.get_roughness
+            normal, delta_normal = pc.get_normal(dir_pp_normalized=dir_pp_normalized, return_delta=True) # (N, 3) 
+            delta_normal_norm = delta_normal.norm(dim=1, keepdim=True)
+            
+            ## indirect_light
+            shs_view = pc.get_indirect_features.view(-1, 4, (pc.indirect_dim+1)**2)
+            # dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_opacity.shape[0], 1))
+            # dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+            # sh2rgb = eval_sh(pc.indirect_dim, shs_view, dir_pp_normalized)
+            # sh2rgb = eval_sh(active_dim, shs_view, dir_pp_normalized)
+            # indirect_light = torch.clamp_min(sh2rgb + 0.5, 0.0)
+            from scene.NVDIFFREC import util as light_util
+            wo = light_util.safe_normalize(viewpoint_camera.camera_center.repeat(pc.get_opacity.shape[0], 1) - pc.get_xyz)
+            reflvec = light_util.safe_normalize(light_util.reflect(wo, normal))
+            sh2rgb = eval_sh(pc.indirect_dim, shs_view, reflvec)
+            # sh2rgb = eval_sh(active_dim, shs_view, reflvec)
+            indirect_alpha = torch.clamp(sh2rgb[..., :1] + 0.5, 0.0, 1.0)
+            indirect_light = torch.clamp_min(sh2rgb[..., 1:4] + 0.5, 0.0)
+            out['indirect_alpha'] = indirect_alpha
+            ####
+            
+            color, brdf_pkg = pc.brdf_mlp.my_shade(gb_pos[None, None, ...], normal[None, None, ...], albedo[None, None, ...], metallic[None, None, ...], roughness[None, None, ...], view_pos[None, None, ...], indirect_alpha[None, None, ...], indirect_light[None, None, ...])
+            
+            colors_precomp = color.squeeze() # (N, 3) 
+            diffuse_color = brdf_pkg['diffuse'].squeeze() # (N, 3) 
+            specular_color = brdf_pkg['specular'].squeeze() # (N, 3) 
+            
+
+            
+            
+                        
+        elif pipe.brdf:
             color_delta = None
             delta_normal_norm = None
             if pipe.brdf_mode=="envmap":
@@ -232,7 +270,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             sh_degree=pc.active_sh_degree,
             campos=viewpoint_camera.camera_center,
             prefiltered=False,
-            # debug=False
+            debug=False
         )
         rasterizer_alpha = GaussianRasterizer(raster_settings=raster_settings_alpha)
         alpha = torch.ones_like(means3D) 
@@ -259,10 +297,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    out = {"render": rendered_image,
+    out.update({"render": rendered_image,
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
             "radii": radii, 
-    }
+    })
     out.update(out_extras)
     return out

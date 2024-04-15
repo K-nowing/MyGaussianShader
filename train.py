@@ -31,6 +31,7 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations):
+    my_brdf = dataset.brdf_dim>=100
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, dataset.brdf_dim, dataset.brdf_mode, dataset.brdf_envmap_res)
 
@@ -54,7 +55,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
                 net_image_bytes = None
                 custom_cam, do_training, pipe.do_shs_python, pipe.do_cov_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
+                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer, my_brdf=my_brdf)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
@@ -80,7 +81,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
                 gaussians.brdf_mlp.build_mips()
 
         # Render
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, debug=False)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, debug=False, my_brdf=my_brdf)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         losses_extra = {}
         if pipe.brdf and iteration > opt.normal_reg_from_iter:
@@ -97,6 +98,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         for k in losses_extra.keys():
             loss += getattr(opt, f'lambda_{k}')* losses_extra[k]
+        losses_extra['indirect_alpha_reg'] = render_pkg['indirect_alpha'].mean() 
+        loss += 0.1 * losses_extra['indirect_alpha_reg']
         loss.backward()
 
         iter_end.record()
@@ -115,7 +118,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
 
             # Log and save
             losses_extra['psnr'] = psnr(image, gt_image).mean()
-            training_report(tb_writer, iteration, Ll1, loss, losses_extra, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1, loss, losses_extra, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), my_brdf=my_brdf)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -162,7 +165,23 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, losses_extra, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+# Code from NeRO
+def linear_to_srgb(linear):
+    if isinstance(linear, torch.Tensor):
+        """Assumes `linear` is in [0, 1], see https://en.wikipedia.org/wiki/SRGB."""
+        eps = torch.finfo(torch.float32).eps
+        srgb0 = 323 / 25 * linear
+        srgb1 = (211 * torch.clamp(linear, min=eps) ** (5 / 12) - 11) / 200
+        return torch.where(linear <= 0.0031308, srgb0, srgb1)
+    elif isinstance(linear, np.ndarray):
+        eps = np.finfo(np.float32).eps
+        srgb0 = 323 / 25 * linear
+        srgb1 = (211 * np.maximum(eps, linear) ** (5 / 12) - 11) / 200
+        return np.where(linear <= 0.0031308, srgb0, srgb1)
+    else:
+        raise NotImplementedError
+
+def training_report(tb_writer, iteration, Ll1, loss, losses_extra, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, my_brdf=False):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -181,7 +200,7 @@ def training_report(tb_writer, iteration, Ll1, loss, losses_extra, l1_loss, elap
                 images = torch.tensor([], device="cuda")
                 gts = torch.tensor([], device="cuda")
                 for idx, viewpoint in enumerate(config['cameras']):
-                    render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
+                    render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs, my_brdf=my_brdf)
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     images = torch.cat((images, image.unsqueeze(0)), dim=0)
@@ -207,6 +226,8 @@ def training_report(tb_writer, iteration, Ll1, loss, losses_extra, l1_loss, elap
                         
                         if renderArgs[0].brdf:
                             lighting = render_lighting(scene.gaussians, resolution=(512, 1024))
+                            if my_brdf:
+                                lighting = linear_to_srgb(lighting)
                             if tb_writer:
                                 tb_writer.add_images(config['name'] + "/lighting", lighting[None], global_step=iteration)
                 l1_test = l1_loss(images, gts)
